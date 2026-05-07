@@ -70,23 +70,29 @@ def merge_tokens_with_dict(tokens, pos_tags, user_dict):
     return merged_tokens, merged_pos
 
 
-def process_files(input_files, dict_file, progress=gr.Progress()):
-    """主要處理函式"""
+BATCH_SIZE = 50  # 每批次處理的行數，用於即時回報進度
+
+
+def process_files(input_files, dict_file):
+    """主要處理函式（使用 yield 串流即時回報進度）"""
     if not input_files:
-        return "請上傳至少一個 .txt 檔案", None
+        yield "請上傳至少一個 .txt 檔案", None
+        return
 
     # 偵測裝置
     device_id, device_name = get_device()
     log_lines = [f"裝置: {device_name}"]
 
     # 載入模型
-    progress(0, desc="載入 CKIP 模型中...")
-    log_lines.append("載入 CKIP 模型中...")
+    log_lines.append("載入 CKIP 模型中（首次需下載模型，請稍候）...")
+    yield '\n'.join(log_lines), None
     try:
         ws, pos = load_models(device_id)
     except Exception as e:
-        return f"模型載入失敗: {e}", None
+        yield f"模型載入失敗: {e}", None
+        return
     log_lines.append("模型載入完成")
+    yield '\n'.join(log_lines), None
 
     # 載入自訂字典
     user_words = set()
@@ -94,6 +100,7 @@ def process_files(input_files, dict_file, progress=gr.Progress()):
         log_lines.append(f"載入自訂字典: {os.path.basename(dict_file)}")
         user_words = load_user_dictionary(dict_file)
         log_lines.append(f"已載入 {len(user_words)} 個自訂詞彙")
+        yield '\n'.join(log_lines), None
 
     # 建立暫存資料夾存放結果
     tmp_dir = tempfile.mkdtemp()
@@ -101,8 +108,8 @@ def process_files(input_files, dict_file, progress=gr.Progress()):
 
     for idx, file_path in enumerate(input_files):
         file_name = os.path.basename(file_path)
-        progress((idx) / total, desc=f"處理 {file_name} ({idx+1}/{total})")
         log_lines.append(f"\n[{idx+1}/{total}] 處理: {file_name}")
+        yield '\n'.join(log_lines), None
 
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
@@ -110,23 +117,44 @@ def process_files(input_files, dict_file, progress=gr.Progress()):
 
             if not text.strip():
                 log_lines.append(f"  警告: {file_name} 為空檔案，跳過")
+                yield '\n'.join(log_lines), None
                 continue
 
             lines = text.split('\n')
             non_empty_lines = [line for line in lines if line.strip()]
+            total_lines = len(non_empty_lines)
 
             if non_empty_lines:
-                # 斷詞
-                log_lines.append("  執行斷詞...")
-                seg_results = ws(non_empty_lines)
+                # 分批斷詞與標註
+                all_seg = []
+                all_pos = []
+                num_batches = (total_lines + BATCH_SIZE - 1) // BATCH_SIZE
 
-                # 詞性標註（在原始斷詞結果上執行）
-                log_lines.append("  執行詞性標註...")
-                pos_results = pos(seg_results)
+                for b in range(num_batches):
+                    start = b * BATCH_SIZE
+                    end = min(start + BATCH_SIZE, total_lines)
+                    batch = non_empty_lines[start:end]
+                    pct = round(end / total_lines * 100)
+
+                    log_lines.append(f"  斷詞中... {end}/{total_lines} 行 ({pct}%)")
+                    yield '\n'.join(log_lines), None
+
+                    seg_batch = ws(batch)
+                    all_seg.extend(seg_batch)
+
+                    log_lines.append(f"  詞性標註中... {end}/{total_lines} 行 ({pct}%)")
+                    yield '\n'.join(log_lines), None
+
+                    pos_batch = pos(seg_batch)
+                    all_pos.extend(pos_batch)
+
+                seg_results = all_seg
+                pos_results = all_pos
 
                 # 套用自訂字典合併
                 if user_words:
                     log_lines.append("  套用自訂字典...")
+                    yield '\n'.join(log_lines), None
                     merged = [merge_tokens_with_dict(seg, pos_tag, user_words)
                               for seg, pos_tag in zip(seg_results, pos_results)]
                     final_tokens_list = [m[0] for m in merged]
@@ -164,28 +192,33 @@ def process_files(input_files, dict_file, progress=gr.Progress()):
                 f.write(seg_text)
 
             log_lines.append(f"  完成 → {output_file_name}")
+            yield '\n'.join(log_lines), None
 
         except Exception as e:
             log_lines.append(f"  錯誤: {e}")
             traceback.print_exc()
+            yield '\n'.join(log_lines), None
             continue
 
-    progress(1, desc="打包結果中...")
-
     # 打包成 zip
+    log_lines.append("\n打包結果中...")
+    yield '\n'.join(log_lines), None
+
     zip_path = os.path.join(tmp_dir, "segmentation_results.zip")
     seg_files = [f for f in os.listdir(tmp_dir) if f.endswith("_seg.txt")]
 
     if not seg_files:
-        return '\n'.join(log_lines) + "\n\n沒有產生任何結果檔案", None
+        log_lines.append("沒有產生任何結果檔案")
+        yield '\n'.join(log_lines), None
+        return
 
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
         for seg_file in seg_files:
             zf.write(os.path.join(tmp_dir, seg_file), seg_file)
 
-    log_lines.append(f"\n所有檔案處理完成！共 {len(seg_files)} 個結果檔案已打包")
+    log_lines.append(f"所有檔案處理完成！共 {len(seg_files)} 個結果檔案已打包")
 
-    return '\n'.join(log_lines), zip_path
+    yield '\n'.join(log_lines), zip_path
 
 
 # ── Gradio 介面 ──────────────────────────────────────────
