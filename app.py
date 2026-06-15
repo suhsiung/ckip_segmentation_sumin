@@ -37,8 +37,12 @@ def load_models(device_id):
     return ws_model, pos_model
 
 
-def load_ner_model(device_id):
-    """載入 CKIP NER 命名實體模型（僅在首次呼叫時載入，供專名探勘使用）"""
+def load_ner_model(device_id=-1):
+    """載入 CKIP NER 命名實體模型（僅在首次呼叫時載入，供專名探勘使用）。
+
+    預設固定用 CPU（device=-1），讓專名探勘不與斷詞搶 GPU 顯存，
+    避免在小顯存（如 6GB）上同時執行兩個分頁時 VRAM 不足而中斷。
+    """
     global ner_model
     if ner_model is None:
         ner_model = CkipNerChunker(model="bert-base", device=device_id)
@@ -559,12 +563,12 @@ def discover_proper_nouns(input_files, dict_file, api_key_override, model_overri
                "OPENROUTER_API_KEY。"), empty_df
         return
 
-    device_id, device_name = get_device()
-    log_lines = [f"裝置: {device_name}", f"使用模型: {model}"]
-    log_lines.append("載入 NER 模型中...")
+    log_lines = [f"使用模型: {model}"]
+    # NER 固定用 CPU，避免與斷詞分頁搶 GPU 顯存（小顯存同時跑兩分頁會中斷）
+    log_lines.append("載入 NER 模型中（CPU 模式，不佔用 GPU）...")
     yield render_log(log_lines), empty_df
     try:
-        ner = load_ner_model(device_id)
+        ner = load_ner_model(-1)
     except Exception as e:
         yield f"NER 模型載入失敗: {e}", empty_df
         return
