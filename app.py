@@ -1,17 +1,23 @@
 import os
 import io
 import re
+import json
+import time
 import zipfile
 import tempfile
 import traceback
+import urllib.request
+import urllib.error
+from collections import Counter, defaultdict
 import torch
 import gradio as gr
-from ckip_transformers.nlp import CkipWordSegmenter, CkipPosTagger
+from ckip_transformers.nlp import CkipWordSegmenter, CkipPosTagger, CkipNerChunker
 
 
 # ── 全域模型（延遲載入） ──────────────────────────────────
 ws_model = None
 pos_model = None
+ner_model = None
 
 
 def get_device():
@@ -29,6 +35,14 @@ def load_models(device_id):
         ws_model = CkipWordSegmenter(model="bert-base", device=device_id)
         pos_model = CkipPosTagger(model="bert-base", device=device_id)
     return ws_model, pos_model
+
+
+def load_ner_model(device_id):
+    """載入 CKIP NER 命名實體模型（僅在首次呼叫時載入，供專名探勘使用）"""
+    global ner_model
+    if ner_model is None:
+        ner_model = CkipNerChunker(model="bert-base", device=device_id)
+    return ner_model
 
 
 def load_user_dictionary(dict_path):
@@ -409,6 +423,280 @@ def process_files(input_files, dict_file):
     yield render_log(log_lines), zip_path
 
 
+# ══════════════════════════════════════════════════════════
+#  專名探勘（OOV 偵測）：NER 抓候選 → LLM 篩選誤判 → 補字典
+#  此功能與斷詞主流程完全獨立，不影響既有處理。
+# ══════════════════════════════════════════════════════════
+
+_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+# 只保留「名稱類」實體，丟掉數字 / 日期 / 時間 / 金額 / 數量等雜訊
+_NAME_TYPES = {"PERSON", "LOC", "GPE", "ORG", "FAC", "NORP", "WORK_OF_ART", "EVENT"}
+_OOV_BATCH_SIZE = 12     # 每次送給 LLM 的候選數
+_OOV_MAX_EXAMPLES = 2    # 每個候選附帶幾個例句
+_OOV_MAX_RETRY = 4
+
+
+def _load_dotenv_value(key):
+    """從 .env 讀取設定（先找 repo 目錄，再找上層目錄），找不到回 None"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for env_path in (os.path.join(here, ".env"),
+                     os.path.join(os.path.dirname(here), ".env")):
+        if os.path.exists(env_path):
+            try:
+                with open(env_path, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        if k.strip() == key:
+                            return v.strip()
+            except Exception:
+                pass
+    return None
+
+
+def _get_openrouter_config(api_key_override, model_override):
+    """決定實際使用的 API key 與模型：UI 欄位優先，其次環境變數 / .env"""
+    api_key = (api_key_override or "").strip() or \
+        os.environ.get("OPENROUTER_API_KEY") or _load_dotenv_value("OPENROUTER_API_KEY")
+    model = (model_override or "").strip() or \
+        os.environ.get("OPENROUTER_MODEL") or _load_dotenv_value("OPENROUTER_MODEL") or \
+        "google/gemma-4-26b-a4b-it"
+    return api_key, model
+
+
+def _call_openrouter(api_key, model, messages, max_retry=_OOV_MAX_RETRY):
+    """呼叫 OpenRouter（OpenAI 相容）chat completions，含退避重試"""
+    payload = {"model": model, "messages": messages, "temperature": 0}
+    data = json.dumps(payload).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost",
+        "X-Title": "ckip-oov-filter",
+    }
+    last_err = None
+    for attempt in range(1, max_retry + 1):
+        try:
+            req = urllib.request.Request(_OPENROUTER_URL, data=data,
+                                         headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            return body["choices"][0]["message"]["content"]
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "ignore")
+            last_err = f"HTTP {e.code}: {detail[:200]}"
+            if e.code in (429, 500, 502, 503):
+                time.sleep(2.0 * attempt)
+                continue
+            break
+        except Exception as e:  # noqa
+            last_err = repr(e)
+            time.sleep(1.5 * attempt)
+    raise RuntimeError(last_err or "未知錯誤")
+
+
+def _extract_json_objects(text):
+    """從 LLM 回應容錯抽出 JSON 物件（吃 code fence / 陣列 / 逐個物件）"""
+    text = (text or "").strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.MULTILINE).strip()
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return [o for o in parsed if isinstance(o, dict)]
+        if isinstance(parsed, dict):
+            return [parsed]
+    except Exception:
+        pass
+    objs = []
+    for m in re.finditer(r"\{[^{}]*\}", text):
+        try:
+            objs.append(json.loads(m.group(0)))
+        except Exception:
+            continue
+    return objs
+
+
+def _build_oov_messages(batch):
+    """batch: list of (candidate, ner_type, count, [examples])"""
+    lines = []
+    for cand, ntype, cnt, exs in batch:
+        ex_txt = " / ".join(exs) if exs else "（無）"
+        lines.append(f'- 候選詞「{cand}」 NER類型={ntype} 出現{cnt}次\n  例句：{ex_txt}')
+    items = "\n".join(lines)
+    sys_msg = (
+        "你是中文語料的命名實體審核員。我會給你一批由 NER 模型抓出的『專有名詞候選詞』，"
+        "這些候選來自一部日系偵探小說（怪盜二十面相／明智小五郎系列）的中文譯本，可能含有誤判。"
+        "請逐一判斷每個候選詞是否為『值得收進斷詞字典的真正專有名詞』"
+        "（人名、地名、機構、設施、作品名、事件名等）。"
+        "下列情況請判為 false：神祇或宗教泛稱、慣用語、單字殘片、被切斷的不完整詞、"
+        "純數字/日期/時間/數量、一般名詞。"
+        "只回傳 JSON 陣列，每個元素格式為："
+        '{"candidate":字串,"is_proper_noun":布林,"type":字串或null,'
+        '"add_to_dict":布林,"reason":簡短中文理由}。不要輸出 JSON 以外的任何文字。'
+    )
+    user_msg = f"請審核下列 {len(batch)} 個候選詞：\n{items}"
+    return [{"role": "system", "content": sys_msg},
+            {"role": "user", "content": user_msg}]
+
+
+# Dataframe 欄位
+_OOV_HEADERS = ["收錄", "候選詞", "次數", "類型", "LLM建議", "理由"]
+
+
+def discover_proper_nouns(input_files, dict_file, api_key_override, model_override):
+    """專名探勘主流程（generator，串流回報進度）。
+    產出：(處理紀錄, 結果表格)。"""
+    empty_df = gr.update(value=[], headers=_OOV_HEADERS)
+    if not input_files:
+        yield "請上傳至少一個 .txt 檔案", empty_df
+        return
+
+    api_key, model = _get_openrouter_config(api_key_override, model_override)
+    if not api_key:
+        yield ("找不到 OpenRouter API key。請在下方欄位填入，或設定 .env 的 "
+               "OPENROUTER_API_KEY。"), empty_df
+        return
+
+    device_id, device_name = get_device()
+    log_lines = [f"裝置: {device_name}", f"使用模型: {model}"]
+    log_lines.append("載入 NER 模型中...")
+    yield render_log(log_lines), empty_df
+    try:
+        ner = load_ner_model(device_id)
+    except Exception as e:
+        yield f"NER 模型載入失敗: {e}", empty_df
+        return
+
+    # 載入字典（用於排除已收錄詞）
+    user_words = set()
+    if dict_file is not None:
+        user_words = load_user_dictionary(dict_file)
+        log_lines.append(f"已載入字典 {len(user_words)} 詞（將排除已收錄者）")
+        yield render_log(log_lines), empty_df
+
+    # 讀取所有文本行
+    all_lines = []
+    for fp in input_files:
+        try:
+            with open(fp, "r", encoding="utf-8-sig") as f:
+                txt = f.read()
+            all_lines.extend([ln.strip() for ln in txt.splitlines() if ln.strip()])
+        except Exception as e:
+            log_lines.append(f"讀取 {os.path.basename(fp)} 失敗: {e}")
+    log_lines.append(f"共 {len(all_lines)} 段文字，開始 NER 抽取...")
+    yield render_log(log_lines), empty_df
+
+    # NER 抽取名稱類實體
+    results = ner(all_lines, use_delim=True)
+    counter = Counter()
+    type_map = {}
+    examples = defaultdict(list)
+    for line, sent in zip(all_lines, results):
+        for ent in sent:
+            w = ent.word.strip()
+            if not w or ent.ner not in _NAME_TYPES:
+                continue
+            counter[w] += 1
+            type_map.setdefault(w, ent.ner)
+            if len(examples[w]) < _OOV_MAX_EXAMPLES and line not in examples[w]:
+                examples[w].append(line if len(line) <= 40 else line[:40] + "…")
+
+    candidates = [(w, type_map[w], c, examples[w])
+                  for w, c in counter.items() if w not in user_words]
+    candidates.sort(key=lambda x: (-x[2], x[0]))
+    log_lines.append(f"名稱類、未收錄候選 {len(candidates)} 個，送 LLM 審核中...")
+    yield render_log(log_lines), empty_df
+
+    if not candidates:
+        log_lines.append("沒有發現新的專名候選。")
+        yield render_log(log_lines), empty_df
+        return
+
+    # 分批送 LLM 審核
+    rows = []
+    total_batches = (len(candidates) + _OOV_BATCH_SIZE - 1) // _OOV_BATCH_SIZE
+    for bi in range(total_batches):
+        batch = candidates[bi * _OOV_BATCH_SIZE:(bi + 1) * _OOV_BATCH_SIZE]
+        log_lines.append(f"  LLM 審核中... 批次 {bi+1}/{total_batches}")
+        yield render_log(log_lines), gr.update(value=rows, headers=_OOV_HEADERS)
+        try:
+            content = _call_openrouter(api_key, model, _build_oov_messages(batch))
+            got = {o.get("candidate"): o for o in _extract_json_objects(content)}
+        except Exception as e:
+            log_lines.append(f"    批次 {bi+1} 失敗: {e}")
+            got = {}
+        for cand, ntype, cnt, _ex in batch:
+            o = got.get(cand, {})
+            add = o.get("add_to_dict")
+            suggest = "收錄" if add is True else ("剔除" if add is False else "未判定")
+            rows.append([
+                bool(add is True),           # 收錄（勾選）：預設依 LLM 建議
+                cand, cnt,
+                o.get("type") or ntype,
+                suggest,
+                o.get("reason", "(LLM未回傳)"),
+            ])
+        time.sleep(0.5)
+
+    keep_n = sum(1 for r in rows if r[0])
+    log_lines.append(f"完成！候選 {len(rows)} 個，LLM 建議收錄 {keep_n} 個。"
+                     f"請在表格勾選確認後，按下方按鈕匯出字典。")
+    yield render_log(log_lines), gr.update(value=rows, headers=_OOV_HEADERS)
+
+
+def export_selected_dict(table, dict_file):
+    """把表格中『收錄』勾選的候選詞，併入原字典，輸出可下載的新字典檔。"""
+    # 取得列資料（Gradio 可能傳 pandas.DataFrame 或 list）
+    rows = []
+    if table is None:
+        rows = []
+    elif hasattr(table, "values"):          # pandas DataFrame
+        rows = table.values.tolist()
+    else:
+        rows = list(table)
+
+    selected = []
+    for r in rows:
+        if len(r) < 2:
+            continue
+        checked = r[0]
+        word = str(r[1]).strip()
+        if word and (checked is True or str(checked).lower() in ("true", "1", "勾選", "v")):
+            selected.append(word)
+
+    # 併入原字典（直接重讀以保留原順序，新詞附在後面，去重）
+    base_words = []
+    seen = set()
+    if dict_file is not None:
+        try:
+            with open(dict_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    w = line.strip()
+                    if w and w not in seen:
+                        base_words.append(w)
+                        seen.add(w)
+        except Exception:
+            pass
+
+    added = []
+    for w in selected:
+        if w not in seen:
+            base_words.append(w)
+            seen.add(w)
+            added.append(w)
+
+    tmp_dir = tempfile.mkdtemp()
+    out_path = os.path.join(tmp_dir, "user_dict_updated.txt")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(base_words) + "\n")
+
+    status = (f"已輸出新字典：原 {len(base_words) - len(added)} 詞 + 新增 {len(added)} 詞 "
+              f"= 共 {len(base_words)} 詞。新增：{'、'.join(added) if added else '（無）'}")
+    return out_path, status
+
+
 # ── Gradio 介面 ──────────────────────────────────────────
 device_id, device_name = get_device()
 
@@ -422,47 +710,113 @@ with gr.Blocks(title="CKIP 中文斷詞與詞性標註工具") as app:
         """
     )
 
-    with gr.Row():
-        with gr.Column(scale=1):
-            input_files = gr.File(
-                label="上傳文本檔案（可多選 .txt）",
-                file_count="multiple",
-                file_types=[".txt"],
-                type="filepath",
-            )
-            dict_file = gr.File(
-                label="上傳自訂字典（選填，.txt，每行一個詞彙）",
-                file_count="single",
-                file_types=[".txt"],
-                type="filepath",
-            )
-            run_btn = gr.Button("開始斷詞與標註", variant="primary", size="lg")
+    with gr.Tabs():
+        # ── 分頁 1：斷詞與詞性標註（既有功能）──────────────────
+        with gr.TabItem("斷詞與詞性標註"):
+            with gr.Row():
+                with gr.Column(scale=1):
+                    input_files = gr.File(
+                        label="上傳文本檔案（可多選 .txt）",
+                        file_count="multiple",
+                        file_types=[".txt"],
+                        type="filepath",
+                    )
+                    dict_file = gr.File(
+                        label="上傳自訂字典（選填，.txt，每行一個詞彙）",
+                        file_count="single",
+                        file_types=[".txt"],
+                        type="filepath",
+                    )
+                    run_btn = gr.Button("開始斷詞與標註", variant="primary", size="lg")
 
-        with gr.Column(scale=1):
-            download_output = gr.File(
-                label="下載結果（ZIP）",
-                interactive=False,
-            )
-            log_output = gr.Textbox(
-                label="處理紀錄",
-                lines=20,
-                max_lines=30,
-                interactive=False,
+                with gr.Column(scale=1):
+                    download_output = gr.File(
+                        label="下載結果（ZIP）",
+                        interactive=False,
+                    )
+                    log_output = gr.Textbox(
+                        label="處理紀錄",
+                        lines=20,
+                        max_lines=30,
+                        interactive=False,
+                    )
+
+            run_btn.click(
+                fn=process_files,
+                inputs=[input_files, dict_file],
+                outputs=[log_output, download_output],
             )
 
-    run_btn.click(
-        fn=process_files,
-        inputs=[input_files, dict_file],
-        outputs=[log_output, download_output],
-    )
+            gr.Markdown(
+                """
+                ---
+                **輸出格式：** `詞彙_詞性` 以空格分隔，例如：`那_Nep 一陣子_Nd 東京都_Nc`
+                **使用方式：** 上傳 .txt 檔案 → 選擇性上傳自訂字典 → 點擊「開始斷詞與標註」→ 下載結果 ZIP
+                """
+            )
 
-    gr.Markdown(
-        """
-        ---
-        **輸出格式：** `詞彙_詞性` 以空格分隔，例如：`那_Nep 一陣子_Nd 東京都_Nc`
-        **使用方式：** 上傳 .txt 檔案 → 選擇性上傳自訂字典 → 點擊「開始斷詞與標註」→ 下載結果 ZIP
-        """
-    )
+        # ── 分頁 2：專名探勘（找出字典未收錄的專有名詞）──────────
+        with gr.TabItem("專名探勘（擴充字典）"):
+            gr.Markdown(
+                "上傳文本，系統會用 **NER** 找出專有名詞候選，再交給 **LLM** "
+                "判斷哪些是真正的專名（過濾神祇泛稱、慣用語、切散殘片等誤判）。"
+                "你可在表格勾選確認後，匯出併入原字典的新字典檔。"
+            )
+            with gr.Row():
+                with gr.Column(scale=1):
+                    oov_input_files = gr.File(
+                        label="上傳文本檔案（可多選 .txt）",
+                        file_count="multiple",
+                        file_types=[".txt"],
+                        type="filepath",
+                    )
+                    oov_dict_file = gr.File(
+                        label="上傳現有字典（選填，用於排除已收錄詞並做為匯出基底）",
+                        file_count="single",
+                        file_types=[".txt"],
+                        type="filepath",
+                    )
+                    oov_api_key = gr.Textbox(
+                        label="OpenRouter API Key（留空則使用 .env 設定）",
+                        type="password",
+                        placeholder="sk-or-...",
+                    )
+                    oov_model = gr.Textbox(
+                        label="模型（留空則使用 .env 或預設）",
+                        placeholder="google/gemma-4-26b-a4b-it",
+                    )
+                    oov_run_btn = gr.Button("開始專名探勘", variant="primary", size="lg")
+                    oov_log = gr.Textbox(
+                        label="處理紀錄",
+                        lines=12,
+                        max_lines=20,
+                        interactive=False,
+                    )
+
+                with gr.Column(scale=2):
+                    oov_table = gr.Dataframe(
+                        headers=_OOV_HEADERS,
+                        datatype=["bool", "str", "number", "str", "str", "str"],
+                        column_count=(6, "fixed"),
+                        label="專名候選（可勾選『收錄』欄）",
+                        interactive=True,
+                        wrap=True,
+                    )
+                    with gr.Row():
+                        oov_export_btn = gr.Button("匯出選取詞典", variant="secondary")
+                    oov_export_status = gr.Textbox(label="匯出結果", interactive=False)
+                    oov_download = gr.File(label="下載更新後字典", interactive=False)
+
+            oov_run_btn.click(
+                fn=discover_proper_nouns,
+                inputs=[oov_input_files, oov_dict_file, oov_api_key, oov_model],
+                outputs=[oov_log, oov_table],
+            )
+            oov_export_btn.click(
+                fn=export_selected_dict,
+                inputs=[oov_table, oov_dict_file],
+                outputs=[oov_download, oov_export_status],
+            )
 
 if __name__ == "__main__":
     app.launch(inbrowser=True, theme=gr.themes.Soft())
