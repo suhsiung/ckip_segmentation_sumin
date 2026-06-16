@@ -8,5 +8,9 @@ build/
 01-Corpus/
 *.zip
 *.log
+# 執行期輸出與本機專用啟動檔
+app_log.txt
+app_err.txt
+啟動斷詞系統.bat
 .DS_Store
 Thumbs.db

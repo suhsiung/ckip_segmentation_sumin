@@ -432,7 +432,61 @@ def process_files(input_files, dict_file):
 #  此功能與斷詞主流程完全獨立，不影響既有處理。
 # ══════════════════════════════════════════════════════════
 
-_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+# ── LLM 供應商設定 ───────────────────────────────────────
+# 各家 LLM 供應商：name -> {端點, 格式, 常用模型清單}
+# 除 Anthropic 採 Messages API 外，其餘皆使用 OpenAI 相容的 /chat/completions。
+_PROVIDERS = {
+    "OpenRouter": {
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "format": "openai",
+        "models": [
+            "google/gemma-4-26b-a4b-it",
+            "google/gemini-2.0-flash-001",
+            "openai/gpt-4o-mini",
+            "openai/gpt-4o",
+            "anthropic/claude-3.5-sonnet",
+            "deepseek/deepseek-chat",
+            "meta-llama/llama-3.3-70b-instruct",
+        ],
+    },
+    "OpenAI": {
+        "url": "https://api.openai.com/v1/chat/completions",
+        "format": "openai",
+        "models": ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1", "o4-mini"],
+    },
+    "Google Gemini": {
+        "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "format": "openai",
+        "models": ["gemini-2.0-flash", "gemini-2.0-flash-lite",
+                   "gemini-1.5-flash", "gemini-1.5-pro"],
+    },
+    "DeepSeek": {
+        "url": "https://api.deepseek.com/v1/chat/completions",
+        "format": "openai",
+        "models": ["deepseek-chat", "deepseek-reasoner"],
+    },
+    "Anthropic": {
+        "url": "https://api.anthropic.com/v1/messages",
+        "format": "anthropic",
+        "models": ["claude-3-5-haiku-latest", "claude-3-5-sonnet-latest",
+                   "claude-sonnet-4-20250514"],
+    },
+    "Groq": {
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "format": "openai",
+        "models": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
+    },
+}
+_DEFAULT_PROVIDER = "OpenRouter"
+# 模型下拉選單最後一個固定選項：讓使用者改為自行輸入模型名稱
+_CUSTOM_MODEL = "✏️ 自行輸入模型名稱…"
+
+
+def _model_choices(provider):
+    """回傳某供應商的模型下拉選項：常用模型清單 + 末尾『自行輸入』選項"""
+    models = list(_PROVIDERS.get(provider, {}).get("models", []))
+    return models + [_CUSTOM_MODEL]
+
 # 只保留「名稱類」實體，丟掉數字 / 日期 / 時間 / 金額 / 數量等雜訊
 _NAME_TYPES = {"PERSON", "LOC", "GPE", "ORG", "FAC", "NORP", "WORK_OF_ART", "EVENT"}
 _OOV_BATCH_SIZE = 12     # 每次送給 LLM 的候選數
@@ -460,33 +514,58 @@ def _load_dotenv_value(key):
     return None
 
 
-def _get_openrouter_config(api_key_override, model_override):
-    """決定實際使用的 API key 與模型：UI 欄位優先，其次環境變數 / .env"""
+def _get_llm_config(provider_override, api_key_override, model_override):
+    """決定實際使用的供應商 / API key / 模型：UI 欄位優先，其次環境變數 / .env。
+    為相容舊設定，仍接受 OPENROUTER_API_KEY / OPENROUTER_MODEL。"""
+    provider = (provider_override or "").strip() or \
+        os.environ.get("LLM_PROVIDER") or _load_dotenv_value("LLM_PROVIDER") or \
+        _DEFAULT_PROVIDER
     api_key = (api_key_override or "").strip() or \
-        os.environ.get("OPENROUTER_API_KEY") or _load_dotenv_value("OPENROUTER_API_KEY")
+        os.environ.get("LLM_API_KEY") or os.environ.get("OPENROUTER_API_KEY") or \
+        _load_dotenv_value("LLM_API_KEY") or _load_dotenv_value("OPENROUTER_API_KEY")
+    default_model = _PROVIDERS.get(provider, {}).get("models") or ["google/gemma-4-26b-a4b-it"]
     model = (model_override or "").strip() or \
-        os.environ.get("OPENROUTER_MODEL") or _load_dotenv_value("OPENROUTER_MODEL") or \
-        "google/gemma-4-26b-a4b-it"
-    return api_key, model
+        os.environ.get("LLM_MODEL") or os.environ.get("OPENROUTER_MODEL") or \
+        _load_dotenv_value("LLM_MODEL") or _load_dotenv_value("OPENROUTER_MODEL") or \
+        default_model[0]
+    return provider, api_key, model
 
 
-def _call_openrouter(api_key, model, messages, max_retry=_OOV_MAX_RETRY):
-    """呼叫 OpenRouter（OpenAI 相容）chat completions，含退避重試"""
-    payload = {"model": model, "messages": messages, "temperature": 0}
+def _call_llm(provider, api_key, model, messages, max_retry=_OOV_MAX_RETRY):
+    """呼叫所選供應商的 chat/messages 端點，含退避重試。
+    支援 OpenAI 相容格式（OpenRouter / OpenAI / Gemini / DeepSeek / Groq）
+    與 Anthropic Messages API。"""
+    cfg = _PROVIDERS.get(provider, _PROVIDERS[_DEFAULT_PROVIDER])
+    url = cfg["url"]
+    if cfg["format"] == "anthropic":
+        # Anthropic Messages API：system 需獨立成參數、headers 也不同
+        sys_txt = "\n".join(m["content"] for m in messages if m["role"] == "system")
+        conv = [m for m in messages if m["role"] != "system"]
+        payload = {"model": model, "max_tokens": 4096, "temperature": 0,
+                   "system": sys_txt, "messages": conv}
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        }
+    else:
+        payload = {"model": model, "messages": messages, "temperature": 0}
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost",
+            "X-Title": "ckip-oov-filter",
+        }
     data = json.dumps(payload).encode("utf-8")
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "http://localhost",
-        "X-Title": "ckip-oov-filter",
-    }
     last_err = None
     for attempt in range(1, max_retry + 1):
         try:
-            req = urllib.request.Request(_OPENROUTER_URL, data=data,
+            req = urllib.request.Request(url, data=data,
                                          headers=headers, method="POST")
             with urllib.request.urlopen(req, timeout=120) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
+            if cfg["format"] == "anthropic":
+                return body["content"][0]["text"]
             return body["choices"][0]["message"]["content"]
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "ignore")
@@ -549,36 +628,53 @@ def _build_oov_messages(batch):
 _OOV_HEADERS = ["收錄", "候選詞", "次數", "類型", "LLM建議", "理由"]
 
 
-def discover_proper_nouns(input_files, dict_file, api_key_override, model_override):
+def discover_proper_nouns(input_files, dict_file, provider_override,
+                          api_key_override, model_override):
     """專名探勘主流程（generator，串流回報進度）。
-    產出：(處理紀錄, 結果表格)。"""
+    產出：(處理紀錄, 結果表格, 進度百分比)。"""
     empty_df = gr.update(value=[], headers=_OOV_HEADERS)
     if not input_files:
-        yield "請上傳至少一個 .txt 檔案", empty_df
+        yield "請上傳至少一個 .txt 檔案", empty_df, 0
         return
 
-    api_key, model = _get_openrouter_config(api_key_override, model_override)
+    if (model_override or "").strip() == _CUSTOM_MODEL:
+        yield ("你選擇了『自行輸入模型名稱』，請直接在模型欄位輸入想使用的"
+               "模型名稱後再執行。"), empty_df, 0
+        return
+
+    provider, api_key, model = _get_llm_config(
+        provider_override, api_key_override, model_override)
     if not api_key:
-        yield ("找不到 OpenRouter API key。請在下方欄位填入，或設定 .env 的 "
-               "OPENROUTER_API_KEY。"), empty_df
+        yield (f"找不到 {provider} 的 API key。請在下方欄位填入，或設定 .env 的 "
+               "LLM_API_KEY。"), empty_df, 0
         return
 
-    log_lines = [f"使用模型: {model}"]
-    # NER 固定用 CPU，避免與斷詞分頁搶 GPU 顯存（小顯存同時跑兩分頁會中斷）
-    log_lines.append("載入 NER 模型中（CPU 模式，不佔用 GPU）...")
-    yield render_log(log_lines), empty_df
+    log_lines = [f"使用供應商: {provider}｜模型: {model}"]
+    # NER 自動偵測裝置：有 GPU 就用 GPU 加速（大顯存如 4090 不必擔心與斷詞搶顯存）；
+    # 若 GPU 顯存不足載入失敗，會自動退回 CPU。
+    ner_device_id, ner_device_name = get_device()
+    log_lines.append(f"載入 NER 模型中（{ner_device_name}）...")
+    yield render_log(log_lines), empty_df, 3
     try:
-        ner = load_ner_model(-1)
+        ner = load_ner_model(ner_device_id)
     except Exception as e:
-        yield f"NER 模型載入失敗: {e}", empty_df
-        return
+        # GPU 載入失敗（例如顯存不足）→ 退回 CPU 重試
+        log_lines.append(f"NER 於 {ner_device_name} 載入失敗（{e}），改用 CPU 重試...")
+        yield render_log(log_lines), empty_df, 3
+        try:
+            global ner_model
+            ner_model = None
+            ner = load_ner_model(-1)
+        except Exception as e2:
+            yield f"NER 模型載入失敗: {e2}", empty_df, 0
+            return
 
     # 載入字典（用於排除已收錄詞）
     user_words = set()
     if dict_file is not None:
         user_words = load_user_dictionary(dict_file)
         log_lines.append(f"已載入字典 {len(user_words)} 詞（將排除已收錄者）")
-        yield render_log(log_lines), empty_df
+        yield render_log(log_lines), empty_df, 5
 
     # 讀取所有文本行
     all_lines = []
@@ -589,8 +685,8 @@ def discover_proper_nouns(input_files, dict_file, api_key_override, model_overri
             all_lines.extend([ln.strip() for ln in txt.splitlines() if ln.strip()])
         except Exception as e:
             log_lines.append(f"讀取 {os.path.basename(fp)} 失敗: {e}")
-    log_lines.append(f"共 {len(all_lines)} 段文字，開始 NER 抽取...")
-    yield render_log(log_lines), empty_df
+    log_lines.append(f"共 {len(all_lines)} 段文字，開始 NER 抽取（{ner_device_name}）...")
+    yield render_log(log_lines), empty_df, 8
 
     # NER 抽取名稱類實體
     results = ner(all_lines, use_delim=True)
@@ -610,23 +706,30 @@ def discover_proper_nouns(input_files, dict_file, api_key_override, model_overri
     candidates = [(w, type_map[w], c, examples[w])
                   for w, c in counter.items() if w not in user_words]
     candidates.sort(key=lambda x: (-x[2], x[0]))
-    log_lines.append(f"名稱類、未收錄候選 {len(candidates)} 個，送 LLM 審核中...")
-    yield render_log(log_lines), empty_df
+    log_lines.append(f"NER 完成。名稱類、未收錄候選 {len(candidates)} 個，送 LLM 審核中...")
+    yield render_log(log_lines), empty_df, 30
 
     if not candidates:
         log_lines.append("沒有發現新的專名候選。")
-        yield render_log(log_lines), empty_df
+        yield render_log(log_lines), empty_df, 100
         return
 
-    # 分批送 LLM 審核
+    # 分批送 LLM 審核（LLM 速度忽快忽慢，故每批前後都更新進度條與用時，讓使用者
+    # 確認系統仍在運作；進度由 30% 線性推進到 100%）
     rows = []
     total_batches = (len(candidates) + _OOV_BATCH_SIZE - 1) // _OOV_BATCH_SIZE
+    t_start = time.time()
     for bi in range(total_batches):
         batch = candidates[bi * _OOV_BATCH_SIZE:(bi + 1) * _OOV_BATCH_SIZE]
-        log_lines.append(f"  LLM 審核中... 批次 {bi+1}/{total_batches}")
-        yield render_log(log_lines), gr.update(value=rows, headers=_OOV_HEADERS)
+        elapsed = int(time.time() - t_start)
+        # 送出前：先把進度條推到「本批起點」，並標明正在等待 LLM 回應
+        pct_before = 30 + int(68 * bi / total_batches)
+        log_lines.append(f"⏳ LLM 審核中... 批次 {bi+1}/{total_batches}"
+                         f"（已用時 {elapsed}s，請稍候，LLM 回應速度不一）")
+        yield (render_log(log_lines),
+               gr.update(value=rows, headers=_OOV_HEADERS), pct_before)
         try:
-            content = _call_openrouter(api_key, model, _build_oov_messages(batch))
+            content = _call_llm(provider, api_key, model, _build_oov_messages(batch))
             got = {o.get("candidate"): o for o in _extract_json_objects(content)}
         except Exception as e:
             log_lines.append(f"    批次 {bi+1} 失敗: {e}")
@@ -642,12 +745,20 @@ def discover_proper_nouns(input_files, dict_file, api_key_override, model_overri
                 suggest,
                 o.get("reason", "(LLM未回傳)"),
             ])
-        time.sleep(0.5)
+        # 完成本批：進度條推到「本批終點」，並回報已處理 / 建議收錄數
+        pct_after = 30 + int(68 * (bi + 1) / total_batches)
+        keep_so_far = sum(1 for r in rows if r[0])
+        log_lines.append(f"✓ 批次 {bi+1}/{total_batches} 完成"
+                         f"（已審 {len(rows)} 詞，建議收錄 {keep_so_far} 個）")
+        yield (render_log(log_lines),
+               gr.update(value=rows, headers=_OOV_HEADERS), pct_after)
+        time.sleep(0.3)
 
     keep_n = sum(1 for r in rows if r[0])
-    log_lines.append(f"完成！候選 {len(rows)} 個，LLM 建議收錄 {keep_n} 個。"
-                     f"請在表格勾選確認後，按下方按鈕匯出字典。")
-    yield render_log(log_lines), gr.update(value=rows, headers=_OOV_HEADERS)
+    total_time = int(time.time() - t_start)
+    log_lines.append(f"🎉 全部完成！候選 {len(rows)} 個，LLM 建議收錄 {keep_n} 個，"
+                     f"共用時 {total_time}s。請在表格勾選確認後，按下方按鈕匯出字典。")
+    yield render_log(log_lines), gr.update(value=rows, headers=_OOV_HEADERS), 100
 
 
 def export_selected_dict(table, dict_file):
@@ -780,24 +891,37 @@ with gr.Blocks(title="CKIP 中文斷詞與詞性標註工具") as app:
                         file_types=[".txt"],
                         type="filepath",
                     )
-                    oov_api_key = gr.Textbox(
-                        label="OpenRouter API Key（留空則使用 .env 設定）",
-                        type="password",
-                        placeholder="sk-or-...",
+                    oov_provider = gr.Dropdown(
+                        label="LLM 供應商",
+                        choices=list(_PROVIDERS.keys()),
+                        value=_DEFAULT_PROVIDER,
                     )
-                    oov_model = gr.Textbox(
-                        label="模型（留空則使用 .env 或預設）",
-                        placeholder="google/gemma-4-26b-a4b-it",
+                    oov_api_key = gr.Textbox(
+                        label="API Key（留空則使用 .env 設定）",
+                        type="password",
+                        placeholder="貼上所選供應商的 API Key",
+                    )
+                    oov_model = gr.Dropdown(
+                        label="模型（可從清單選擇，或選『自行輸入模型名稱…』後直接輸入）",
+                        choices=_model_choices(_DEFAULT_PROVIDER),
+                        value=_PROVIDERS[_DEFAULT_PROVIDER]["models"][0],
+                        allow_custom_value=True,
                     )
                     oov_run_btn = gr.Button("開始專名探勘", variant="primary", size="lg")
-                    oov_log = gr.Textbox(
-                        label="處理紀錄",
-                        lines=12,
-                        max_lines=20,
-                        interactive=False,
-                    )
 
                 with gr.Column(scale=2):
+                    # 處理紀錄移到右上方，並加上進度條，避免 LLM 忽快忽慢時誤以為當機
+                    oov_progress = gr.Slider(
+                        label="進度",
+                        minimum=0, maximum=100, value=0, step=1,
+                        interactive=False,
+                    )
+                    oov_log = gr.Textbox(
+                        label="處理紀錄（最新狀態在最上方）",
+                        lines=8,
+                        max_lines=12,
+                        interactive=False,
+                    )
                     oov_table = gr.Dataframe(
                         headers=_OOV_HEADERS,
                         datatype=["bool", "str", "number", "str", "str", "str"],
@@ -811,10 +935,24 @@ with gr.Blocks(title="CKIP 中文斷詞與詞性標註工具") as app:
                     oov_export_status = gr.Textbox(label="匯出結果", interactive=False)
                     oov_download = gr.File(label="下載更新後字典", interactive=False)
 
+            def _on_provider_change(provider):
+                """切換供應商時，更新模型下拉清單為該供應商的常用模型
+                （末尾保留『自行輸入模型名稱…』選項）"""
+                models = _PROVIDERS.get(provider, {}).get("models", [])
+                return gr.update(choices=_model_choices(provider),
+                                 value=(models[0] if models else _CUSTOM_MODEL))
+
+            oov_provider.change(
+                fn=_on_provider_change,
+                inputs=[oov_provider],
+                outputs=[oov_model],
+            )
+
             oov_run_btn.click(
                 fn=discover_proper_nouns,
-                inputs=[oov_input_files, oov_dict_file, oov_api_key, oov_model],
-                outputs=[oov_log, oov_table],
+                inputs=[oov_input_files, oov_dict_file, oov_provider,
+                        oov_api_key, oov_model],
+                outputs=[oov_log, oov_table, oov_progress],
             )
             oov_export_btn.click(
                 fn=export_selected_dict,
