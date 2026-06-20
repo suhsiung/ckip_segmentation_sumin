@@ -5,6 +5,7 @@ import json
 import time
 import zipfile
 import tempfile
+import threading
 import traceback
 import urllib.request
 import urllib.error
@@ -18,6 +19,22 @@ from ckip_transformers.nlp import CkipWordSegmenter, CkipPosTagger, CkipNerChunk
 ws_model = None
 pos_model = None
 ner_model = None
+
+# ── 全域互斥鎖：斷詞與專名探勘一次只能執行一項 ──────────────
+# （兩者都吃 GPU/CPU 模型，避免同時執行造成顯存不足或互相拖慢）
+_RUN_LOCK = threading.Lock()
+
+
+def _run_exclusive(gen, busy_value):
+    """以全域鎖包裝一個產生器：若另一項作業正在執行，立即回報忙碌並結束；
+    否則取得鎖、串流原作業，結束時（含例外）必定釋放鎖。"""
+    if not _RUN_LOCK.acquire(blocking=False):
+        yield busy_value
+        return
+    try:
+        yield from gen
+    finally:
+        _RUN_LOCK.release()
 
 
 def get_device():
@@ -266,6 +283,13 @@ def render_log(log_lines):
 
 
 def process_files(input_files, dict_file):
+    """斷詞主流程（互斥包裝）：與專名探勘一次只能執行一項。"""
+    busy = ("⚠️ 系統忙碌中：「專名探勘」或另一項斷詞作業正在執行。"
+            "一次只能執行一項（以避免顯存不足），請等其完成後再試。", None)
+    yield from _run_exclusive(_process_files_impl(input_files, dict_file), busy)
+
+
+def _process_files_impl(input_files, dict_file):
     """主要處理函式（使用 yield 串流即時回報進度）"""
     if not input_files:
         yield "請上傳至少一個 .txt 檔案", None
@@ -628,8 +652,47 @@ def _build_oov_messages(batch):
 _OOV_HEADERS = ["收錄", "候選詞", "次數", "類型", "LLM建議", "理由"]
 
 
+# ── 防呆：偵測並還原「已斷詞」格式的輸入 ──────────────────────
+# 若使用者誤把斷詞輸出檔（詞_詞性，如「日本_Nc 的_DE 大_Na 飯店_Nc」）
+# 拿來做專名探勘，NER 會把詞性標記也吞進去，產生 Nc / Di / 小林_Nb 等垃圾候選。
+# 這裡偵測該格式並還原為原始文字，再進行 NER。
+_POS_TAGGED_TOKEN = re.compile(r'^.+_[A-Z][A-Za-z]*\d*$')
+
+
+def _looks_segmented(lines, sample=60):
+    """以前 sample 行抽樣，若多數空白分隔 token 形如『詞_詞性』，判定為已斷詞格式。"""
+    tagged = total = 0
+    for ln in lines[:sample]:
+        for tok in ln.split():
+            total += 1
+            if _POS_TAGGED_TOKEN.match(tok):
+                tagged += 1
+    return total > 0 and (tagged / total) >= 0.6
+
+
+def _strip_pos_tags(line):
+    """將『詞_詞性 詞_詞性 …』還原為原始文字（去詞性標記與人工空白）。"""
+    words = []
+    for tok in line.split():
+        m = re.match(r'^(.+)_[A-Z][A-Za-z]*\d*$', tok)
+        words.append(m.group(1) if m else tok)
+    return ''.join(words)
+
+
 def discover_proper_nouns(input_files, dict_file, provider_override,
                           api_key_override, model_override):
+    """專名探勘主流程（互斥包裝）：與斷詞一次只能執行一項。"""
+    busy = ("⚠️ 系統忙碌中：「斷詞」或另一項專名探勘作業正在執行。"
+            "一次只能執行一項（以避免顯存不足），請等其完成後再試。",
+            gr.update(), 0)
+    yield from _run_exclusive(
+        _discover_proper_nouns_impl(input_files, dict_file, provider_override,
+                                    api_key_override, model_override),
+        busy)
+
+
+def _discover_proper_nouns_impl(input_files, dict_file, provider_override,
+                                api_key_override, model_override):
     """專名探勘主流程（generator，串流回報進度）。
     產出：(處理紀錄, 結果表格, 進度百分比)。"""
     empty_df = gr.update(value=[], headers=_OOV_HEADERS)
@@ -685,6 +748,14 @@ def discover_proper_nouns(input_files, dict_file, provider_override,
             all_lines.extend([ln.strip() for ln in txt.splitlines() if ln.strip()])
         except Exception as e:
             log_lines.append(f"讀取 {os.path.basename(fp)} 失敗: {e}")
+
+    # 防呆：若輸入其實是「已斷詞」格式（詞_詞性），自動還原為原始文字再做 NER
+    if _looks_segmented(all_lines):
+        all_lines = [_strip_pos_tags(ln) for ln in all_lines]
+        log_lines.append("⚠️ 偵測到輸入為『已斷詞』格式（詞_詞性），已自動還原為原始文字。"
+                         "建議直接上傳原始文本以獲得最佳結果。")
+        yield render_log(log_lines), empty_df, 7
+
     log_lines.append(f"共 {len(all_lines)} 段文字，開始 NER 抽取（{ner_device_name}）...")
     yield render_log(log_lines), empty_df, 8
 
@@ -815,13 +886,86 @@ def export_selected_dict(table, dict_file):
 # ── Gradio 介面 ──────────────────────────────────────────
 device_id, device_name = get_device()
 
-with gr.Blocks(title="CKIP 中文斷詞與詞性標註工具") as app:
-    gr.Markdown(
-        f"""
-        # CKIP 中文斷詞與詞性標註工具
-        使用中研院 CKIP Transformers 進行中文斷詞與詞性標註（POS Tagging）。
+# 設計系統（由 ui-ux-pro-max skill 產生）：
+#   信任藍 #2563EB 主視覺 + 翡翠綠 #10B981「執行」鍵（開發工具慣例 run=綠）
+#   字體：Poppins（拉丁/數字）→ Noto Sans TC（繁中），等寬用 JetBrains Mono
+THEME = gr.themes.Soft(
+    primary_hue=gr.themes.colors.emerald,
+    secondary_hue=gr.themes.colors.blue,
+    neutral_hue=gr.themes.colors.slate,
+    # 注意：font 清單只在第 0 位放 GoogleFont，其餘用字串，
+    # 以避開 Gradio launch 比對主題時的 GoogleFont.__eq__(str) 例外。
+    # Poppins（標題拉丁字）改於 CSS @import 套用。
+    font=[gr.themes.GoogleFont("Noto Sans TC"), "ui-sans-serif", "system-ui", "sans-serif"],
+    font_mono=[gr.themes.GoogleFont("JetBrains Mono"), "ui-monospace", "monospace"],
+).set(
+    body_background_fill="#F8FAFC",
+    block_background_fill="#FFFFFF",
+    block_border_width="1px",
+    block_radius="14px",
+    block_label_text_weight="600",
+    button_large_radius="10px",
+    button_primary_background_fill="#10B981",
+    button_primary_background_fill_hover="#059669",
+    button_primary_text_color="#FFFFFF",
+    button_secondary_background_fill="#EEF2FF",
+    button_secondary_text_color="#1E293B",
+)
 
-        **目前裝置：{device_name}**
+CUSTOM_CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@500;600;700&display=swap');
+.gradio-container { max-width: 1180px !important; margin: 0 auto !important; }
+* { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+.app-header h1, h1, h2, h3 { font-family: 'Poppins', 'Noto Sans TC', sans-serif; }
+
+/* ── 標題橫幅 ── */
+.app-header {
+  background: linear-gradient(135deg, #0F172A 0%, #1E293B 45%, #2563EB 130%);
+  color: #fff; border-radius: 16px; padding: 26px 30px; margin-bottom: 6px;
+  box-shadow: 0 8px 24px rgba(37,99,235,.18);
+}
+.app-header h1 { margin: 0; font-size: 1.55rem; font-weight: 700; letter-spacing: .2px; line-height: 1.25; }
+.app-header p  { margin: .45rem 0 0; color: #CBD5E1; font-size: .95rem; line-height: 1.6; }
+.app-header .badge {
+  display: inline-flex; align-items: center; gap: 7px; margin-top: 15px;
+  background: rgba(255,255,255,.10); border: 1px solid rgba(255,255,255,.22);
+  padding: 5px 13px; border-radius: 999px; font-size: .82rem; color: #ECFDF5; font-weight: 500;
+}
+.app-header .dot { width: 8px; height: 8px; border-radius: 50%; background: #34D399;
+  box-shadow: 0 0 0 3px rgba(52,211,153,.25); }
+
+/* ── 互動 ── */
+button { cursor: pointer; transition: all .2s ease !important; }
+.run-btn button, button.run-btn { font-weight: 600 !important; letter-spacing: .3px; }
+button:focus-visible, .tab-nav button:focus-visible { outline: 2px solid #2563EB !important; outline-offset: 2px; }
+
+/* ── 分頁 ── */
+.tab-nav button { font-weight: 600 !important; }
+.tab-nav button.selected { color: #2563EB !important; }
+
+/* ── 紀錄/結果：終端風格等寬 ── */
+.log-box textarea {
+  font-family: 'JetBrains Mono', ui-monospace, monospace !important;
+  font-size: 13px !important; line-height: 1.65 !important;
+  background: #0F172A !important; color: #E2E8F0 !important;
+  border-radius: 10px !important; border: 1px solid #1E293B !important;
+}
+
+/* ── 區塊標籤更清楚 ── */
+.block .label-wrap span, label span { letter-spacing: .2px; }
+
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+"""
+
+with gr.Blocks(title="CKIP 中文斷詞與詞性標註工具") as app:
+    gr.HTML(
+        f"""
+        <div class="app-header">
+          <h1>CKIP 中文斷詞與詞性標註工具</h1>
+          <p>使用中央研究院 CKIP Transformers 進行中文斷詞（Word Segmentation）與詞性標註（POS Tagging），
+             並提供以 NER + LLM 擴充字典的「專名探勘」功能。</p>
+          <span class="badge"><span class="dot"></span>運算裝置：{device_name}</span>
+        </div>
         """
     )
 
@@ -842,7 +986,8 @@ with gr.Blocks(title="CKIP 中文斷詞與詞性標註工具") as app:
                         file_types=[".txt"],
                         type="filepath",
                     )
-                    run_btn = gr.Button("開始斷詞與標註", variant="primary", size="lg")
+                    run_btn = gr.Button("開始斷詞與標註", variant="primary",
+                                        size="lg", elem_classes=["run-btn"])
 
                 with gr.Column(scale=1):
                     download_output = gr.File(
@@ -854,6 +999,7 @@ with gr.Blocks(title="CKIP 中文斷詞與詞性標註工具") as app:
                         lines=20,
                         max_lines=30,
                         interactive=False,
+                        elem_classes=["log-box"],
                     )
 
             run_btn.click(
@@ -907,7 +1053,8 @@ with gr.Blocks(title="CKIP 中文斷詞與詞性標註工具") as app:
                         value=_PROVIDERS[_DEFAULT_PROVIDER]["models"][0],
                         allow_custom_value=True,
                     )
-                    oov_run_btn = gr.Button("開始專名探勘", variant="primary", size="lg")
+                    oov_run_btn = gr.Button("開始專名探勘", variant="primary",
+                                            size="lg", elem_classes=["run-btn"])
 
                 with gr.Column(scale=2):
                     # 處理紀錄移到右上方，並加上進度條，避免 LLM 忽快忽慢時誤以為當機
@@ -921,6 +1068,7 @@ with gr.Blocks(title="CKIP 中文斷詞與詞性標註工具") as app:
                         lines=8,
                         max_lines=12,
                         interactive=False,
+                        elem_classes=["log-box"],
                     )
                     oov_table = gr.Dataframe(
                         headers=_OOV_HEADERS,
@@ -961,4 +1109,4 @@ with gr.Blocks(title="CKIP 中文斷詞與詞性標註工具") as app:
             )
 
 if __name__ == "__main__":
-    app.launch(inbrowser=True, theme=gr.themes.Soft())
+    app.launch(inbrowser=True, theme=THEME, css=CUSTOM_CSS)
