@@ -295,6 +295,25 @@ def _process_files_impl(input_files, dict_file):
         yield "請上傳至少一個 .txt 檔案", None
         return
 
+    # 防呆：偵測輸入是否其實已是「斷詞輸出」格式（詞_詞性）。
+    # 若是，立即停止處理並請使用者改上傳「原始未斷詞文本」，
+    # 避免把已斷詞檔再次斷詞而產生亂碼結果。
+    segmented_files = []
+    for file_path in input_files:
+        try:
+            with open(file_path, 'r', encoding='utf-8-sig') as f:
+                lines = [ln for ln in f.read().splitlines() if ln.strip()]
+        except Exception:
+            lines = []
+        if _looks_segmented(lines):
+            segmented_files.append(os.path.basename(file_path))
+    if segmented_files:
+        names = "、".join(segmented_files)
+        yield (f"⛔ 已停止處理：偵測到上傳的檔案似乎『已完成斷詞』（詞_詞性 格式）：{names}\n"
+               f"本工具需要的是【原始、未斷詞的文本】。\n"
+               f"請改上傳原文文本後，再執行一次斷詞。", None)
+        return
+
     # 偵測裝置
     device_id, device_name = get_device()
     log_lines = [f"裝置: {device_name}"]
@@ -409,8 +428,13 @@ def _process_files_impl(input_files, dict_file):
                         word_pos_pairs.pop(0)
                     # 步驟 2-(6)：套用詞性 / 斷詞修正規則（i–liv）
                     line_text = postprocess_line(' '.join(word_pos_pairs))
-                    result_lines.append(line_text)
                     non_empty_idx += 1
+                    # 步驟 2-(7)：刪除「以 _ETCCATEGORY 詞性開頭」的整行
+                    #（例如省略號 …_ETCCATEGORY 起首的行，整行直接不輸出）
+                    first_token = line_text.split()
+                    if first_token and first_token[0].endswith('_ETCCATEGORY'):
+                        continue
+                    result_lines.append(line_text)
 
             seg_text = '\n'.join(result_lines)
 
@@ -918,17 +942,31 @@ CUSTOM_CSS = """
 * { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
 .app-header h1, h1, h2, h3 { font-family: 'Poppins', 'Noto Sans TC', sans-serif; }
 
-/* ── 標題橫幅 ── */
+/* ── 標題橫幅（置中，深藍底 + 藍紫漸層主標 + 兩段式次標）── */
 .app-header {
-  background: linear-gradient(135deg, #0F172A 0%, #1E293B 45%, #2563EB 130%);
-  color: #fff; border-radius: 16px; padding: 26px 30px; margin-bottom: 6px;
+  background: linear-gradient(180deg, #0A0F20 0%, #0E1530 100%);
+  color: #fff; border-radius: 16px; padding: 34px 30px 28px; margin-bottom: 6px;
+  text-align: center;
   box-shadow: 0 8px 24px rgba(37,99,235,.18);
 }
-.app-header h1 { margin: 0; font-size: 1.55rem; font-weight: 700; letter-spacing: .2px; line-height: 1.25; }
-.app-header p  { margin: .45rem 0 0; color: #CBD5E1; font-size: .95rem; line-height: 1.6; }
+/* 主標題：大字、藍→紫漸層文字 */
+.app-header .app-title {
+  margin: 0; font-size: 2.15rem; font-weight: 700; letter-spacing: 2px; line-height: 1.3;
+  background: linear-gradient(90deg, #7C9EF8 0%, #A6A6F6 50%, #C2A8F2 100%);
+  -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent; color: #A6A6F6;
+}
+/* 次標題：小字、淺色，兩段以直線分隔，置中 */
+.app-header .app-subtitle {
+  margin: .55rem 0 0; font-size: .98rem; line-height: 1.6;
+  display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 12px;
+}
+.app-header .sub-en  { color: #7C88BE; letter-spacing: .3px; }
+.app-header .sub-sep { color: #424E7C; }
+.app-header .sub-zh  { color: #A2ABD6; letter-spacing: 1px; }
 .app-header .badge {
-  display: inline-flex; align-items: center; gap: 7px; margin-top: 15px;
-  background: rgba(255,255,255,.10); border: 1px solid rgba(255,255,255,.22);
+  display: inline-flex; align-items: center; gap: 7px; margin-top: 16px;
+  background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.18);
   padding: 5px 13px; border-radius: 999px; font-size: .82rem; color: #ECFDF5; font-weight: 500;
 }
 .app-header .dot { width: 8px; height: 8px; border-radius: 50%; background: #34D399;
@@ -957,13 +995,16 @@ button:focus-visible, .tab-nav button:focus-visible { outline: 2px solid #2563EB
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 """
 
-with gr.Blocks(title="CKIP 中文斷詞與詞性標註工具") as app:
+with gr.Blocks(title="譯彩紛呈：重譯文本分析系統") as app:
     gr.HTML(
         f"""
         <div class="app-header">
-          <h1>CKIP 中文斷詞與詞性標註工具</h1>
-          <p>使用中央研究院 CKIP Transformers 進行中文斷詞（Word Segmentation）與詞性標註（POS Tagging），
-             並提供以 NER + LLM 擴充字典的「專名探勘」功能。</p>
+          <h1 class="app-title">譯彩紛呈：重譯文本分析系統</h1>
+          <p class="app-subtitle">
+            <span class="sub-en">TransPrism: An Analytical Framework for Retranslation I</span>
+            <span class="sub-sep">│</span>
+            <span class="sub-zh">語料淬煉 Corpus Refinery</span>
+          </p>
           <span class="badge"><span class="dot"></span>運算裝置：{device_name}</span>
         </div>
         """
