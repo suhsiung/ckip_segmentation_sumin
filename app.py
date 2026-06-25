@@ -67,7 +67,7 @@ def load_ner_model(device_id=-1):
 
 
 def load_user_dictionary(dict_path):
-    """載入自訂字典，回傳詞彙集合"""
+    """載入自訂詞典，回傳詞彙集合"""
     words = set()
     try:
         with open(dict_path, 'r', encoding='utf-8') as f:
@@ -76,12 +76,12 @@ def load_user_dictionary(dict_path):
                 if word:
                     words.add(word)
     except Exception as e:
-        print(f"載入字典時發生錯誤: {e}")
+        print(f"載入詞典時發生錯誤: {e}")
     return words
 
 
 def merge_tokens_with_dict(tokens, pos_tags, user_dict):
-    """使用自訂字典合併斷詞結果與對應的詞性標註"""
+    """使用自訂詞典合併斷詞結果與對應的詞性標註"""
     if not user_dict:
         return tokens, pos_tags
 
@@ -329,10 +329,10 @@ def _process_files_impl(input_files, dict_file):
     log_lines.append("模型載入完成")
     yield render_log(log_lines), None
 
-    # 載入自訂字典
+    # 載入自訂詞典
     user_words = set()
     if dict_file is not None:
-        log_lines.append(f"載入自訂字典: {os.path.basename(dict_file)}")
+        log_lines.append(f"載入自訂詞典: {os.path.basename(dict_file)}")
         user_words = load_user_dictionary(dict_file)
         log_lines.append(f"已載入 {len(user_words)} 個自訂詞彙")
         yield render_log(log_lines), None
@@ -389,9 +389,9 @@ def _process_files_impl(input_files, dict_file):
                 seg_results = all_seg
                 pos_results = all_pos
 
-                # 套用自訂字典合併
+                # 套用自訂詞典合併
                 if user_words:
-                    log_lines.append("  套用自訂字典...")
+                    log_lines.append("  套用自訂詞典...")
                     yield render_log(log_lines), None
                     merged = [merge_tokens_with_dict(seg, pos_tag, user_words)
                               for seg, pos_tag in zip(seg_results, pos_results)]
@@ -476,7 +476,7 @@ def _process_files_impl(input_files, dict_file):
 
 
 # ══════════════════════════════════════════════════════════
-#  專名探勘（OOV 偵測）：NER 抓候選 → LLM 篩選誤判 → 補字典
+#  專名探勘（OOV 偵測）：NER 抓候選 → LLM 篩選誤判 → 補詞典
 #  此功能與斷詞主流程完全獨立，不影響既有處理。
 # ══════════════════════════════════════════════════════════
 
@@ -659,7 +659,7 @@ def _build_oov_messages(batch):
     sys_msg = (
         "你是中文語料的命名實體審核員。我會給你一批由 NER 模型抓出的『專有名詞候選詞』，"
         "這些候選來自一部日系偵探小說（怪盜二十面相／明智小五郎系列）的中文譯本，可能含有誤判。"
-        "請逐一判斷每個候選詞是否為『值得收進斷詞字典的真正專有名詞』"
+        "請逐一判斷每個候選詞是否為『值得收進斷詞詞典的真正專有名詞』"
         "（人名、地名、機構、設施、作品名、事件名等）。"
         "下列情況請判為 false：神祇或宗教泛稱、慣用語、單字殘片、被切斷的不完整詞、"
         "純數字/日期/時間/數量、一般名詞。"
@@ -756,11 +756,11 @@ def _discover_proper_nouns_impl(input_files, dict_file, provider_override,
             yield f"NER 模型載入失敗: {e2}", empty_df, 0
             return
 
-    # 載入字典（用於排除已收錄詞）
+    # 載入詞典（用於排除已收錄詞）
     user_words = set()
     if dict_file is not None:
         user_words = load_user_dictionary(dict_file)
-        log_lines.append(f"已載入字典 {len(user_words)} 詞（將排除已收錄者）")
+        log_lines.append(f"已載入詞典 {len(user_words)} 詞（將排除已收錄者）")
         yield render_log(log_lines), empty_df, 5
 
     # 讀取所有文本行
@@ -852,12 +852,12 @@ def _discover_proper_nouns_impl(input_files, dict_file, provider_override,
     keep_n = sum(1 for r in rows if r[0])
     total_time = int(time.time() - t_start)
     log_lines.append(f"🎉 全部完成！候選 {len(rows)} 個，LLM 建議收錄 {keep_n} 個，"
-                     f"共用時 {total_time}s。請在表格勾選確認後，按下方按鈕匯出字典。")
+                     f"共用時 {total_time}s。請在表格勾選確認後，按下方按鈕匯出詞典。")
     yield render_log(log_lines), gr.update(value=rows, headers=_OOV_HEADERS), 100
 
 
 def export_selected_dict(table, dict_file):
-    """把表格中『收錄』勾選的候選詞，併入原字典，輸出可下載的新字典檔。"""
+    """把表格中『收錄』勾選的候選詞，併入原詞典，輸出可下載的新詞典檔。"""
     # 取得列資料（Gradio 可能傳 pandas.DataFrame 或 list）
     rows = []
     if table is None:
@@ -876,7 +876,7 @@ def export_selected_dict(table, dict_file):
         if word and (checked is True or str(checked).lower() in ("true", "1", "勾選", "v")):
             selected.append(word)
 
-    # 併入原字典（直接重讀以保留原順序，新詞附在後面，去重）
+    # 併入原詞典（直接重讀以保留原順序，新詞附在後面，去重）
     base_words = []
     seen = set()
     if dict_file is not None:
@@ -902,7 +902,7 @@ def export_selected_dict(table, dict_file):
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(base_words) + "\n")
 
-    status = (f"已輸出新字典：原 {len(base_words) - len(added)} 詞 + 新增 {len(added)} 詞 "
+    status = (f"已輸出新詞典：原 {len(base_words) - len(added)} 詞 + 新增 {len(added)} 詞 "
               f"= 共 {len(base_words)} 詞。新增：{'、'.join(added) if added else '（無）'}")
     return out_path, status
 
@@ -964,6 +964,10 @@ CUSTOM_CSS = """
 .app-header .sub-en  { color: #7C88BE; letter-spacing: .3px; }
 .app-header .sub-sep { color: #424E7C; }
 .app-header .sub-zh  { color: #A2ABD6; letter-spacing: 1px; }
+.app-header .app-desc {
+  margin: .85rem auto 0; max-width: 760px; color: #9AA4D0;
+  font-size: .9rem; line-height: 1.7;
+}
 .app-header .badge {
   display: inline-flex; align-items: center; gap: 7px; margin-top: 16px;
   background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.18);
@@ -1005,6 +1009,7 @@ with gr.Blocks(title="譯彩紛呈：重譯文本分析系統") as app:
             <span class="sub-sep">│</span>
             <span class="sub-zh">語料淬煉 Corpus Refinery</span>
           </p>
+          <p class="app-desc">使用中研院 CKIP Transformers 進行中文斷詞與詞性標註（POS Tagging）；可輔以 LLM 進行專有名詞探勘，擴充詞典。</p>
           <span class="badge"><span class="dot"></span>運算裝置：{device_name}</span>
         </div>
         """
@@ -1022,7 +1027,7 @@ with gr.Blocks(title="譯彩紛呈：重譯文本分析系統") as app:
                         type="filepath",
                     )
                     dict_file = gr.File(
-                        label="上傳自訂字典（選填，.txt，每行一個詞彙）",
+                        label="上傳自訂詞典（選填，.txt，每行一個詞彙）",
                         file_count="single",
                         file_types=[".txt"],
                         type="filepath",
@@ -1053,16 +1058,16 @@ with gr.Blocks(title="譯彩紛呈：重譯文本分析系統") as app:
                 """
                 ---
                 **輸出格式：** `詞彙_詞性` 以空格分隔，例如：`那_Nep 一陣子_Nd 東京都_Nc`
-                **使用方式：** 上傳 .txt 檔案 → 選擇性上傳自訂字典 → 點擊「開始斷詞與標註」→ 下載結果 ZIP
+                **使用方式：** 上傳 .txt 檔案 → 選擇性上傳自訂詞典 → 點擊「開始斷詞與標註」→ 下載結果 ZIP
                 """
             )
 
-        # ── 分頁 2：專名探勘（找出字典未收錄的專有名詞）──────────
-        with gr.TabItem("專名探勘（擴充字典）"):
+        # ── 分頁 2：專名探勘（找出詞典未收錄的專有名詞）──────────
+        with gr.TabItem("專名探勘（擴充詞典）"):
             gr.Markdown(
                 "上傳文本，系統會用 **NER** 找出專有名詞候選，再交給 **LLM** "
                 "判斷哪些是真正的專名（過濾神祇泛稱、慣用語、切散殘片等誤判）。"
-                "你可在表格勾選確認後，匯出併入原字典的新字典檔。"
+                "你可在表格勾選確認後，匯出併入原詞典的新詞典檔。"
             )
             with gr.Row():
                 with gr.Column(scale=1):
@@ -1073,7 +1078,7 @@ with gr.Blocks(title="譯彩紛呈：重譯文本分析系統") as app:
                         type="filepath",
                     )
                     oov_dict_file = gr.File(
-                        label="上傳現有字典（選填，用於排除已收錄詞並做為匯出基底）",
+                        label="上傳現有詞典（選填，用於排除已收錄詞並做為匯出基底）",
                         file_count="single",
                         file_types=[".txt"],
                         type="filepath",
@@ -1122,7 +1127,7 @@ with gr.Blocks(title="譯彩紛呈：重譯文本分析系統") as app:
                     with gr.Row():
                         oov_export_btn = gr.Button("匯出選取詞典", variant="secondary")
                     oov_export_status = gr.Textbox(label="匯出結果", interactive=False)
-                    oov_download = gr.File(label="下載更新後字典", interactive=False)
+                    oov_download = gr.File(label="下載更新後詞典", interactive=False)
 
             def _on_provider_change(provider):
                 """切換供應商時，更新模型下拉清單為該供應商的常用模型
