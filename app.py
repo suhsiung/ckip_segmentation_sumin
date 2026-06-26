@@ -1018,6 +1018,10 @@ with gr.Blocks(title="譯彩紛呈：重譯文本分析系統") as app:
     with gr.Tabs():
         # ── 分頁 1：斷詞與詞性標註（既有功能）──────────────────
         with gr.TabItem("斷詞與詞性標註"):
+            gr.Markdown(
+                "使用 **CKIP Transformers** 進行中文斷詞與詞性標註（POS tagging）。"
+                "上傳 .txt 檔（詞典為選填），即可開始斷詞。"
+            )
             with gr.Row():
                 with gr.Column(scale=1):
                     input_files = gr.File(
