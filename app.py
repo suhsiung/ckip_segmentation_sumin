@@ -937,7 +937,7 @@ THEME = gr.themes.Soft(
 )
 
 CUSTOM_CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@500;600;700&family=Noto+Serif+TC:wght@600;700;900&display=swap');
 .gradio-container { max-width: 1180px !important; margin: 0 auto !important; }
 * { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
 .app-header h1, h1, h2, h3 { font-family: 'Poppins', 'Noto Sans TC', sans-serif; }
@@ -951,19 +951,24 @@ CUSTOM_CSS = """
 }
 /* 主標題：大字、藍→紫漸層文字 */
 .app-header .app-title {
-  margin: 0; font-size: 2.15rem; font-weight: 700; letter-spacing: 2px; line-height: 1.3;
+  margin: 0; font-family: 'Noto Serif TC', serif;
+  font-size: 2.2rem; font-weight: 900; letter-spacing: 3px; line-height: 1.35;
   background: linear-gradient(90deg, #7C9EF8 0%, #A6A6F6 50%, #C2A8F2 100%);
   -webkit-background-clip: text; background-clip: text;
   -webkit-text-fill-color: transparent; color: #A6A6F6;
 }
 /* 次標題：小字、淺色，兩段以直線分隔，置中 */
-.app-header .app-subtitle {
-  margin: .55rem 0 0; font-size: .98rem; line-height: 1.6;
-  display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 12px;
+/* 第二行：較小字、較淡 */
+.app-header .app-sub2 {
+  margin: .5rem 0 0; font-size: .82rem; font-weight: 400; line-height: 1.5;
+  color: #8893C9; letter-spacing: .3px; text-align: center;
 }
-.app-header .sub-en  { color: #7C88BE; letter-spacing: .3px; }
-.app-header .sub-sep { color: #424E7C; }
-.app-header .sub-zh  { color: #A2ABD6; letter-spacing: 1px; }
+/* 第三行：粗體、亮藍紫，較醒目（中文襯線、拉丁無襯線） */
+.app-header .app-sub3 {
+  margin: .18rem 0 0; font-family: 'Poppins', 'Noto Serif TC', sans-serif;
+  font-size: 1.05rem; font-weight: 700; line-height: 1.5;
+  color: #AAB2EC; letter-spacing: 1px; text-align: center;
+}
 .app-header .app-desc {
   margin: .85rem auto 0; max-width: 760px; color: #9AA4D0;
   font-size: .9rem; line-height: 1.7;
@@ -1004,13 +1009,8 @@ with gr.Blocks(title="譯彩紛呈：重譯文本分析系統") as app:
         f"""
         <div class="app-header">
           <h1 class="app-title">譯彩紛呈：重譯文本分析系統</h1>
-          <p class="app-subtitle">
-            <span class="sub-en">TransPrism: An Analytical Framework for Retranslation I</span>
-            <span class="sub-sep">│</span>
-            <span class="sub-zh">語料淬煉 Corpus Refinery</span>
-          </p>
-          <p class="app-desc">使用中研院 CKIP Transformers 進行中文斷詞與詞性標註（POS Tagging）；可輔以 LLM 進行專有名詞探勘，擴充詞典。</p>
-          <span class="badge"><span class="dot"></span>運算裝置：{device_name}</span>
+          <p class="app-sub2">TransPrism: An Analytical Framework for Retranslation</p>
+          <p class="app-sub3">I 語料淬煉 CorpusRefinery</p>
         </div>
         """
     )
@@ -1065,9 +1065,8 @@ with gr.Blocks(title="譯彩紛呈：重譯文本分析系統") as app:
         # ── 分頁 2：專名探勘（找出詞典未收錄的專有名詞）──────────
         with gr.TabItem("專名探勘（擴充詞典）"):
             gr.Markdown(
-                "上傳文本，系統會用 **NER** 找出專有名詞候選，再交給 **LLM** "
-                "判斷哪些是真正的專名（過濾神祇泛稱、慣用語、切散殘片等誤判）。"
-                "你可在表格勾選確認後，匯出併入原詞典的新詞典檔。"
+                "上傳文本後，系統自動識別專有名詞候選，經 **LLM** 篩選確認。"
+                "勾選後併入原詞典，匯出為新詞典檔。"
             )
             with gr.Row():
                 with gr.Column(scale=1):
